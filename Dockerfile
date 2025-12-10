@@ -32,5 +32,6 @@ COPY . /app
 ENV PORT 10000
 ENV PYTHONUNBUFFERED=1
 
-# Use gunicorn as the production server binding to $PORT
-CMD ["gunicorn", "app:app", "-b", "0.0.0.0:${PORT}", "--workers", "1", "--threads", "4"]
+# Use gunicorn as the production server binding to
+CMD ["sh", "-c", "gunicorn app:app -b 0.0.0.0:$PORT --workers 1 --threads 4"]
+
