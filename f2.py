@@ -9,7 +9,7 @@ st.set_page_config(page_title="Building Seg - Frontend", layout="wide")
 st.title("Frontend — YOLOv8 Building Segmentation (test backend)")
 
 st.sidebar.header("Settings")
-backend_url = st.sidebar.text_input("Backend base URL (no trailing slash)", value="https://your-backend.onrender.com")
+backend_url = st.sidebar.text_input("Backend base URL (no trailing slash)", value="https://buildingsegmentation.onrender.com")
 api_endpoint = st.sidebar.text_input("API endpoint (relative to backend)", value="/api/process")
 full_endpoint = backend_url.rstrip("/") + api_endpoint
 
