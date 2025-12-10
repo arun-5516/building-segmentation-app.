@@ -1,0 +1,11 @@
+__pycache__
+*.pyc
+.env
+venv
+.envrc
+.git
+output_results
+runs
+*.pt
+*.pth
+*.zip
