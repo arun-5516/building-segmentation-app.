@@ -1,55 +1,62 @@
 # app.py
-import os
 import io
 import zipfile
-from datetime import datetime
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
-from predict_service import predict_image
-
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-OUTPUT_DIR = os.path.join(BASE_DIR, "output_results")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+from predict_service import predict_image_bytes  # expects (image_bytes, conf, meters_per_pixel, min_area_m2) -> mask_bytes, overlay_bytes, geojson_bytes, debug_bytes
 
 app = Flask(__name__)
 CORS(app)
 
 @app.route("/api/process", methods=["POST"])
 def api_process():
+    # Expect files in form field 'images' (multiple)
     if "images" not in request.files:
-        return "No files uploaded", 400
+        return jsonify({"error": "No files uploaded. Use form field 'images'."}), 400
+
     files = request.files.getlist("images")
-    job_files = []
-    for f in files:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        safe_base = os.path.splitext(f.filename)[0] + "_" + ts
-        in_path = os.path.join(OUTPUT_DIR, f"input_{safe_base}{os.path.splitext(f.filename)[1]}")
-        f.save(in_path)
+    conf = float(request.form.get("conf", 0.25))
+    meters_per_pixel = float(request.form.get("meters_per_pixel", 0.03))
+    min_area_m2 = float(request.form.get("min_area_m2", 0.05))
 
-        try:
-            produced = predict_image(in_path, OUTPUT_DIR, safe_base, conf=float(request.form.get("conf", 0.25)))
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
+    # Create an in-memory ZIP
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for f in files:
+            name = f.filename.rsplit(".", 1)[0]
+            try:
+                img_bytes = f.read()
+                mask_b, overlay_b, geojson_b, debug_b = predict_image_bytes(
+                    img_bytes,
+                    conf=conf,
+                    meters_per_pixel=meters_per_pixel,
+                    min_area_m2=min_area_m2
+                )
+            except Exception as e:
+                # include an error text file for this input
+                zf.writestr(f"{name}_error.txt", str(e))
+                continue
 
-        job_files.extend(produced)
+            # write outputs to zip (only if present)
+            if mask_b:
+                zf.writestr(f"{name}_mask.png", mask_b)
+            if overlay_b:
+                zf.writestr(f"{name}_overlay.png", overlay_b)
+            if geojson_b:
+                zf.writestr(f"{name}.geojson", geojson_b)
+            if debug_b:
+                zf.writestr(f"{name}_debug_mask.png", debug_b)
 
-    # create single zip per request
-    zip_name = f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-    zip_path = os.path.join(OUTPUT_DIR, zip_name)
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for p in job_files:
-            zf.write(p, arcname=os.path.basename(p))
+    zip_buf.seek(0)
+    # Return zip as attachment
+    return send_file(zip_buf, mimetype="application/zip", as_attachment=True, download_name="results.zip")
 
-    # return zip download path
-    return jsonify({
-        "zip_url": f"/outputs/{os.path.basename(zip_path)}",
-        "files": [f"/outputs/{os.path.basename(p)}" for p in job_files]
-    })
-
-@app.route("/outputs/<path:fname>")
-def serve_outputs(fname):
-    return send_from_directory(OUTPUT_DIR, fname)
+# quick health endpoint
+@app.route("/ping")
+def ping():
+    return "ok", 200
 
 if __name__ == "__main__":
+    import os
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
