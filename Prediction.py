@@ -1,11 +1,12 @@
 """
 predict_and_postprocess_final.py
 Full end-to-end script (YOLOv8 seg -> binary mask -> postprocess -> GeoJSON + outline overlay).
-Windows-safe (forward-slashes), tuned to keep small roofs, avoids union by default,
-splits MultiPolygons, and saves debug masks.
+Windows-safe (forward-slashes), tuned for building footprint extraction.
 
-Save to:
-C:/Users/Arun/PycharmProjects/building_seg/predict_and_postprocess_final.py
+UPDATED FOR REVIEW:
+- Uses 'best_colab.pt' model
+- Enables retina_masks=True (Sharp edges)
+- Increases polygon smoothing (cleaner lines)
 """
 import os
 import glob
@@ -21,12 +22,14 @@ from PIL import Image, ImageDraw
 
 # --------------------------- USER CONFIG (edit if needed) ---------------------------
 BASE_DIR = "C:/Users/Arun/PycharmProjects/building_seg"   # use forward slashes (safe)
-model_path = os.path.join(BASE_DIR, "runs", "segment", "building_yolov8_seg", "weights", "best.pt")
+
+# ✅ FIX 1: Point to the model you downloaded from Colab
+model_path = os.path.join(BASE_DIR, "best_colab.pt")
 
 # Inputs: either a single image path or a folder (set one)
-input_image = "C:/Users/Arun/PycharmProjects/building_seg/test_images/ar1.png"
+# ✅ CHECK THIS PATH matches your actual image location
+input_image = "C:/Users/Arun/PycharmProjects/building_seg/test_images/map2.jpg"
 input_folder = None
-# create this folder and add images
 
 # Output folder
 output_dir = os.path.join(BASE_DIR, "output_results")
@@ -37,27 +40,26 @@ use_orig_for_overlay = True
 
 # --------------------------- TUNED PARAMETERS ---------------------------
 meters_per_pixel = 0.03      # set correctly for your orthomosaic (e.g., 0.03 = 3cm)
-min_area_m2 = 0.05           # keep tiny roofs (0.05 m²)
-conf_thres = 0.25            # lower confidence to pick small detections
-do_union = False             # IMPORTANT: keep individual polygons (do not union)
-kernel_small = np.ones((3, 3), np.uint8)  # small kernel to avoid merging
-epsilon_px = 0.5             # approxPolyDP epsilon in pixels (smaller -> more vertices)
-simplify_tol_px = 0.2        # polygon simplify tolerance (small)
-outline_width = 2            # overlay stroke width for outlines
-device = "cpu"               # or 0 for GPU
+min_area_m2 = 0.05           # keep tiny roofs
+conf_thres = 0.25            # confidence threshold
+
+# ✅ FIX 2: Increased smoothing to fix "wobbly" lines
+epsilon_px = 3.0             # approxPolyDP epsilon (Higher = straighter lines. Try 3.0 or 5.0)
+simplify_tol_px = 0.5        # polygon simplify tolerance
+
+do_union = False             # keep individual polygons
+kernel_small = np.ones((3, 3), np.uint8)
+outline_width = 2
+device = "cpu"               # CPU is fine for inference
 # ------------------------------------------------------------------------------------
 
 print("Config:")
 print(" BASE_DIR:", BASE_DIR)
 print(" model_path:", model_path)
-print(" input_folder:", input_folder)
-print(" meters_per_pixel:", meters_per_pixel, "min_area_m2:", min_area_m2)
-print(" conf_thres:", conf_thres, "do_union:", do_union)
+print(" input_image:", input_image)
+print(" Smoothing (epsilon):", epsilon_px)
 
 # ------------------- Derived & safety checks -------------------
-pixel_tol = max(1, int(round(0.10 / meters_per_pixel)))  # not used directly; kept for reference
-
-# Prepare image list
 if input_image:
     image_paths = [input_image]
 else:
@@ -65,20 +67,16 @@ else:
     image_paths = [p for p in image_paths if p.lower().endswith((".jpg", ".jpeg", ".png", ".tif", ".tiff"))]
 
 if not image_paths:
-    raise SystemExit(f"No input images found in: {input_folder} (or set input_image).")
+    raise SystemExit(f"No input images found! Check your path.")
 
 # Load model
 if not os.path.exists(model_path):
-    raise SystemExit(f"Trained model not found at: {model_path}. Train first or set model_path correctly.")
+    raise SystemExit(f"Model not found at: {model_path}. Did you move 'best.pt' to your project folder and rename it?")
 model = YOLO(model_path)
-print("Loaded YOLO model.")
+print("✅ Loaded YOLO model.")
 
 # ------------------- Utility: combine YOLO masks -------------------
 def masks_to_combined_uint8(masks_tensor):
-    """
-    Convert YOLO masks tensor-like object into combined binary uint8 mask (0/255).
-    Handles shapes (H,W) or (N,H,W).
-    """
     if hasattr(masks_tensor, "detach"):
         arr = masks_tensor.detach().cpu().numpy()
     else:
@@ -91,35 +89,23 @@ def masks_to_combined_uint8(masks_tensor):
         for m in arr:
             combined = np.maximum(combined, (m > 0.5).astype(np.uint8))
     else:
-        raise RuntimeError(f"Unexpected masks array shape: {arr.shape}")
+        return np.zeros((100,100), dtype=np.uint8) # fallback
 
     return (combined * 255).astype(np.uint8)
 
 
-# ------------------- Postprocessing (handles MultiPolygon) -------------------
-def postprocess_mask_individual(mask_uint8, image_path, base_outname,
-                                meters_per_pixel=meters_per_pixel,
-                                min_area_m2=min_area_m2,
-                                epsilon_px=epsilon_px,
-                                simplify_tol_px=simplify_tol_px,
-                                do_union=do_union,
-                                outline_width=outline_width):
-    """
-    - Keeps individual contours as separate polygons by default (do_union=False).
-    - Splits MultiPolygon results into parts.
-    - Saves GeoJSON (pixel coords) and an outline-only overlay PNG.
-    """
+# ------------------- Postprocessing -------------------
+def postprocess_mask_individual(mask_uint8, image_path, base_outname):
     # Ensure binary
     _, binary = cv2.threshold(mask_uint8, 127, 255, cv2.THRESH_BINARY)
 
-    # Small morphological cleaning to avoid over-merging
+    # Clean up noise
     closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_small, iterations=1)
     opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel_small, iterations=1)
 
-    # Fill small holes via flood fill on inverted mask
-    inv = cv2.bitwise_not(opened)
-    h, w = inv.shape
-    mask_floodfill = inv.copy()
+    # Fill holes
+    h, w = opened.shape
+    mask_floodfill = cv2.bitwise_not(opened)
     mask_temp = np.zeros((h + 2, w + 2), np.uint8)
     cv2.floodFill(mask_floodfill, mask_temp, (0, 0), 255)
     filled = cv2.bitwise_not(mask_floodfill)
@@ -131,58 +117,35 @@ def postprocess_mask_individual(mask_uint8, image_path, base_outname,
     polygons = []
     for cnt in contours:
         area_px = cv2.contourArea(cnt)
-        area_m2 = area_px * (meters_per_pixel ** 2)
-        if area_m2 < min_area_m2:
+        if area_px * (meters_per_pixel ** 2) < min_area_m2:
             continue
 
+        # Polygon Approximation (The "Straight Lines" trick)
         approx = cv2.approxPolyDP(cnt, epsilon_px, True)
         if approx is None or len(approx) < 3:
             continue
 
         pts = approx.reshape(-1, 2)
         poly = Polygon(pts).buffer(0)
-        if not poly.is_valid or poly.is_empty:
-            continue
 
-        if poly.area * (meters_per_pixel ** 2) < min_area_m2:
-            continue
-
-        polygons.append(poly)
+        if poly.is_valid and not poly.is_empty:
+             polygons.append(poly)
 
     if not polygons:
-        debug_mask_path = os.path.join(output_dir, f"debug_{base_outname}_mask.png")
-        cv2.imwrite(debug_mask_path, binary_clean)
-        print(f"No polygons found after filtering. Debug mask saved: {debug_mask_path}")
-        return None, debug_mask_path
+        print(f"No polygons found for {base_outname}")
+        return None, None
 
-    # Optionally union overlapping polygons (turned off by default)
-    if do_union:
-        unioned = unary_union(polygons)
-        if unioned.geom_type == "Polygon":
-            polygons = [unioned]
-        elif unioned.geom_type == "MultiPolygon":
-            polygons = list(unioned.geoms)
-
-    # Simplify polygons a little and keep valid ones; split MultiPolygons into parts
+    # Simplify
     simplified_parts = []
     for p in polygons:
         p2 = p.simplify(simplify_tol_px, preserve_topology=True).buffer(0)
-        if not (p2.is_valid and not p2.is_empty):
-            continue
-        if p2.geom_type == "MultiPolygon":
-            for part in p2.geoms:
-                if part.is_valid and not part.is_empty:
-                    simplified_parts.append(part)
-        else:
-            simplified_parts.append(p2)
+        if p2.is_valid and not p2.is_empty:
+            if p2.geom_type == "MultiPolygon":
+                simplified_parts.extend([g for g in p2.geoms if g.is_valid])
+            else:
+                simplified_parts.append(p2)
 
-    if not simplified_parts:
-        debug_mask_path = os.path.join(output_dir, f"debug_{base_outname}_mask2.png")
-        cv2.imwrite(debug_mask_path, binary_clean)
-        print(f"No valid polygons after simplification. Debug mask saved: {debug_mask_path}")
-        return None, debug_mask_path
-
-    # Write GeoJSON (pixel coordinates) — one feature per polygon part
+    # Write GeoJSON
     features = []
     for i, poly in enumerate(simplified_parts):
         features.append({
@@ -193,9 +156,8 @@ def postprocess_mask_individual(mask_uint8, image_path, base_outname,
     geojson_path = os.path.join(output_dir, f"clean_buildings_{base_outname}.geojson")
     with open(geojson_path, "w") as f:
         json.dump({"type": "FeatureCollection", "features": features}, f)
-    print("Saved GeoJSON:", geojson_path)
 
-    # Create outline-only overlay (draw exterior + interiors)
+    # Create Overlay
     if image_path and os.path.exists(image_path) and use_orig_for_overlay:
         orig_img = Image.open(image_path).convert("RGBA")
     else:
@@ -203,23 +165,19 @@ def postprocess_mask_individual(mask_uint8, image_path, base_outname,
 
     overlay = Image.new("RGBA", orig_img.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-    outline_color = (255, 0, 0, 200)  # red w/ alpha
+    outline_color = (255, 0, 0, 255)  # Solid Red
 
     for poly in simplified_parts:
-        # exterior ring
-        exterior_coords = [(float(x), float(y)) for x, y in poly.exterior.coords]
-        if len(exterior_coords) >= 2:
-            draw.line(exterior_coords + [exterior_coords[0]], fill=outline_color, width=outline_width)
-        # interiors (holes)
+        if poly.exterior:
+            coords = list(poly.exterior.coords)
+            draw.line(coords, fill=outline_color, width=outline_width)
         for interior in poly.interiors:
-            interior_coords = [(float(x), float(y)) for x, y in interior.coords]
-            if len(interior_coords) >= 2:
-                draw.line(interior_coords + [interior_coords[0]], fill=outline_color, width=max(1, outline_width-1))
+            coords = list(interior.coords)
+            draw.line(coords, fill=outline_color, width=outline_width)
 
     combined = Image.alpha_composite(orig_img, overlay)
-    overlay_path = os.path.join(output_dir, f"final_polygons_outline_{base_outname}.png")
+    overlay_path = os.path.join(output_dir, f"final_result_{base_outname}.png")
     combined.convert("RGB").save(overlay_path)
-    print("Saved outline overlay:", overlay_path)
 
     return geojson_path, overlay_path
 
@@ -227,49 +185,34 @@ def postprocess_mask_individual(mask_uint8, image_path, base_outname,
 # ------------------------ MAIN LOOP ------------------------
 for img_path in image_paths:
     name = Path(img_path).stem
-    print("\nProcessing:", img_path)
+    print(f"\n🚀 Processing: {name}")
 
-    # Run YOLO inference
-    results = model.predict(img_path, conf=conf_thres, device=device)
+    # ✅ FIX 3: High Quality Inference Settings
+    # This generates sharp masks at original resolution
+    results = model.predict(
+        img_path,
+        conf=conf_thres,
+        imgsz=640,          # Match training size
+        retina_masks=True,  # <--- MAGIC SWITCH for sharp edges
+        device=device,
+        verbose=False
+    )
     r = results[0]
 
     mask_uint8 = None
-    if hasattr(r, "masks") and r.masks is not None:
-        try:
-            mask_uint8 = masks_to_combined_uint8(r.masks.data)
-        except Exception:
-            try:
-                mask_uint8 = masks_to_combined_uint8(r.masks)
-            except Exception as e:
-                print("Failed to extract masks:", e)
-                mask_uint8 = None
+    if r.masks is not None:
+        mask_uint8 = masks_to_combined_uint8(r.masks.data)
 
-    if mask_uint8 is None:
-        print("No mask available for", img_path)
-        continue
+    if mask_uint8 is not None:
+        # Save raw mask debug
+        cv2.imwrite(os.path.join(output_dir, f"{name}_raw_mask.png"), mask_uint8)
 
-    # Ensure solidity and a small close
-    mask_uint8 = cv2.morphologyEx(mask_uint8, cv2.MORPH_CLOSE, kernel_small, iterations=1)
+        # Run Post-processing
+        out_geo, out_img = postprocess_mask_individual(mask_uint8, img_path, name)
 
-    # Save mask for debugging/viewing
-    mask_outpath = os.path.join(output_dir, f"{name}_mask.png")
-    cv2.imwrite(mask_outpath, mask_uint8)
-    print("Saved mask:", mask_outpath)
+        if out_img:
+            print(f"✅ Success! Saved overlay: {out_img}")
+    else:
+        print("❌ No buildings detected.")
 
-    # Save a debug mask too
-    debug_mask_path = os.path.join(output_dir, f"{name}_mask_debug.png")
-    cv2.imwrite(debug_mask_path, mask_uint8)
-    print("Saved debug mask:", debug_mask_path)
-
-    # Postprocess (individual polygons, outline overlay)
-    out_geojson, out_overlay = postprocess_mask_individual(
-        mask_uint8, img_path, name,
-        meters_per_pixel=meters_per_pixel,
-        min_area_m2=min_area_m2,
-        epsilon_px=epsilon_px,
-        simplify_tol_px=simplify_tol_px,
-        do_union=do_union,
-        outline_width=outline_width
-    )
-
-print("\n✓ All done. Results in:", os.path.abspath(output_dir))
+print("\nDONE. Check your output_results folder.")
