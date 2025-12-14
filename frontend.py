@@ -1,6 +1,9 @@
 """
 Streamlit app: YOLOv8 segmentation -> mask -> polygon postprocess -> download ZIP
-UPDATED FOR REVIEW: Uses best_colab.pt, retina_masks=True, and tuned smoothing.
+UPDATED:
+- Fixed NumPy/PyTorch warnings
+- Fixed Streamlit 'use_column_width' deprecation warning
+- Uses 'best_colab.pt' with High Quality settings (retina_masks)
 """
 import streamlit as st
 import os
@@ -46,7 +49,7 @@ st.markdown(
 def load_model(model_path: str):
     if not os.path.exists(model_path):
         st.error(f"❌ Model file not found: **{model_path}**")
-        st.error("Please move your 'best.pt' file to this folder and rename it to 'best_colab.pt'.")
+        st.error("Please ensure 'best_colab.pt' is in your GitHub repository.")
         st.stop()
     model = YOLO(model_path)
     return model
@@ -58,11 +61,15 @@ def masks_to_combined_uint8(masks_tensor):
     """
     if masks_tensor is None:
         return None
-    try:
-        # many ultralytics versions store masks.data as (N,H,W)
-        arr = getattr(masks_tensor, "data", masks_tensor)
-        arr = np.array(arr)
-    except Exception:
+    
+    # ✅ FIX 3: Robust Tensor conversion to avoid NumPy warnings
+    if hasattr(masks_tensor, "data"):
+        masks_tensor = masks_tensor.data
+    
+    if hasattr(masks_tensor, "cpu"):
+        arr = masks_tensor.cpu().numpy()
+    else:
+        # Fallback for other array types
         arr = np.array(masks_tensor)
 
     if arr.ndim == 2:
@@ -72,7 +79,8 @@ def masks_to_combined_uint8(masks_tensor):
         for m in arr:
             combined = np.maximum(combined, (m > 0.5).astype(np.uint8))
     else:
-        return np.zeros((100, 100), dtype=np.uint8) # fallback
+        # Fallback empty mask if shape is weird
+        return np.zeros((100, 100), dtype=np.uint8)
 
     return (combined * 255).astype(np.uint8)
 
@@ -112,18 +120,18 @@ def postprocess_mask_individual(mask_uint8, image_path=None,
         area_m2 = area_px * (meters_per_pixel ** 2)
         if area_m2 < min_area_m2:
             continue
-
+        
         # Polygon Approximation (Straightens wobbly lines)
         approx = cv2.approxPolyDP(cnt, epsilon_px, True)
         if approx is None or len(approx) < 3:
             continue
-
+            
         pts = approx.reshape(-1, 2)
         poly = Polygon(pts).buffer(0)
-
+        
         if not poly.is_valid or poly.is_empty:
             continue
-
+            
         polygons.append(poly)
 
     if not polygons:
@@ -216,7 +224,11 @@ outline_width = st.sidebar.slider("Line Width", 1, 5, 2)
 use_orig_overlay = st.sidebar.checkbox("Overlay on Original Image", value=USE_ORIG_FOR_OVERLAY)
 
 # Load model once
-model = load_model(MODEL_PATH)
+try:
+    model = load_model(MODEL_PATH)
+except Exception as e:
+    st.error(f"Error loading model: {e}")
+    st.stop()
 
 # Upload
 uploaded_files = st.file_uploader("Drop images here...", type=["png", "jpg", "jpeg", "tif", "tiff"], accept_multiple_files=True)
@@ -227,8 +239,8 @@ if st.button("🚀 Run Segmentation"):
         st.stop()
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        output_files = []
-
+        output_files = []  
+        
         # Tabs for multiple images
         tabs = st.tabs([up.name for up in uploaded_files])
 
@@ -241,11 +253,11 @@ if st.button("🚀 Run Segmentation"):
                 with open(tmp_img_path, "wb") as f:
                     f.write(up.getbuffer())
 
-                # ✅ FIX 3: Run YOLOv8 Inference with Retina Masks
+                # ✅ FIX 4: Run YOLOv8 Inference with Retina Masks
                 with st.spinner("Detecting buildings..."):
                     results = model.predict(
-                        source=tmp_img_path,
-                        conf=conf_thres,
+                        source=tmp_img_path, 
+                        conf=conf_thres, 
                         imgsz=640,          # Match training size
                         retina_masks=True,  # <--- CRITICAL for sharp edges
                         device="cpu"
@@ -259,7 +271,7 @@ if st.button("🚀 Run Segmentation"):
                 # Extract masks
                 mask_uint8 = None
                 if r.masks is not None:
-                    mask_uint8 = masks_to_combined_uint8(r.masks.data)
+                    mask_uint8 = masks_to_combined_uint8(r.masks)
 
                 if mask_uint8 is None:
                     st.warning("No buildings detected.")
@@ -279,10 +291,11 @@ if st.button("🚀 Run Segmentation"):
                 # Display Results
                 col1, col2 = st.columns(2)
                 with col1:
-                    st.image(mask_uint8, caption="Raw Mask", use_column_width=True, channels="GRAY")
+                    # ✅ FIX 5: Use 'use_container_width' instead of 'use_column_width'
+                    st.image(mask_uint8, caption="Raw Mask", use_container_width=True, channels="GRAY")
                 with col2:
                     if overlay_bytes:
-                        st.image(overlay_bytes, caption="Final Result", use_column_width=True)
+                        st.image(overlay_bytes, caption="Final Result", use_container_width=True)
                     else:
                         st.warning("No valid polygons found.")
 
@@ -301,8 +314,8 @@ if st.button("🚀 Run Segmentation"):
 
             st.success("Processing Complete!")
             st.download_button(
-                label="📥 Download Results (ZIP)",
-                data=zip_buf.getvalue(),
-                file_name="building_results.zip",
+                label="📥 Download Results (ZIP)", 
+                data=zip_buf.getvalue(), 
+                file_name="building_results.zip", 
                 mime="application/zip"
             )
